@@ -48,7 +48,7 @@ DR_init.__dsr__model = ROBOT_MODEL
 # ─────────────────────────────────────────────────────────────
 # 안전/동작 파라미터
 TARGET_LABEL = "green_car"      # YOLO 허용 라벨(예: 자동차)
-CAP_LABEL = "black_cap"          # YOLO 허용 라벨(예: 자동차)
+CAP_LABEL = "white_cap"          # YOLO 허용 라벨(예: 자동차)
 NOZZLE_LABEL = "nozzels"         # YOLO 허용 라벨(예: 자동차)
 LABEL_TIMEOUT_SEC = 3.0          # 허용 라벨 감지 유지 시간
 V_MAX = 60                       # 이동 속도 상한 (Doosan 단위)
@@ -71,6 +71,15 @@ class MotionController(Node):
         self.get_logger().info("🤖 MotionController (combined) starting...")
         self.coord_buffer = deque(maxlen=10)  # 최근 10개 좌표 유지
         self.last_valid_coord = None           # 최근 안정 좌표
+        
+        try:
+            self.gripper = GripperController(node=self, namespace=ROBOT_ID)
+            if not self.gripper.initialize():
+                raise RuntimeError("Gripper initialization failed")
+
+        except Exception as e:
+            self.get_logger().error(f"❌ Gripper/Init error: {e}")
+            raise
 
         # 구독/퍼블리셔
         self.sub_start = self.create_subscription(String, '/fuel_task/start', self.on_task_start, 10)
@@ -97,57 +106,49 @@ class MotionController(Node):
     # ─────────────────────────────────────────────────────────
     # 초기화 및 유틸
     def _init_gripper_and_home(self):
-        try:
-            from DSR_ROBOT2 import wait, movej
-            self.gripper = GripperController(node=self, namespace=ROBOT_ID)
-            if not self.gripper.initialize():
-                raise RuntimeError("Gripper initialization failed")
+        from DSR_ROBOT2 import wait, movej
+        self.get_logger().info("홈 자세 이동")
+        movej([0, 0, 90, 0, 90, 0], 60, 60)
+        wait(2.0)
 
-            self.get_logger().info("홈 자세 이동")
-            movej([0, 0, 90, 0, 90, 0], 60, 60)
-            wait(2.0)
+        # self.gripper_move(0)
+        # self.gripper_move(700)
+        # self.gripper_move(500)
+        # self.gripper_move(200)
+        # self.gripper_move(0)
 
-            # self.gripper_move(0)
-            # self.gripper_move(700)
-            # self.gripper_move(500)
-            # self.gripper_move(200)
-            # self.gripper_move(0)
+        # === 추가되는 초기화 변수들 ===
+        self.ORIENT_FUEL_POS = None
+        self.ORIENT_GUN_POS = None
+        self.ORIENT_CAP_POS = None
+        
+        # FSM/주문 상태
+        self.current_state = "IDLE"  # IDLE → PROGRESS → DONE
+        self.order_id = None
+        self.fuel_type = None
+        self.amount = 0.0
 
-            # === 추가되는 초기화 변수들 ===
-            self.ORIENT_CAP_POS = None
-            self.ORIENT_GUN_POS = None
-            
-            # FSM/주문 상태
-            self.current_state = "IDLE"  # IDLE → PROGRESS → DONE
-            self.order_id = None
-            self.fuel_type = None
-            self.amount = 0.0
+        # 감지 상태
+        self.last_label_ts = 0.0
+        self.allowed_label = CAP_LABEL
+        self.last_car_detected_event = False
+        self.start_fuel = False
+        self.is_moving = False
 
-            # 감지 상태
-            self.last_label_ts = 0.0
-            self.allowed_label = CAP_LABEL
-            self.last_car_detected_event = False
-            self.start_fuel = False
-            self.is_moving = False
+        # -Y축에서 플래그
+        self.object_task_done = False
+        self.xy_centered_once = False
+        self.arrived_Y = False
 
-            # -Y축에서 플래그
-            self.object_task_done = False
-            self.xy_centered_once = False
-            self.arrived_Y = False
+        # 이동 상태
+        self.is_busy = False
+        self.force_triggered = False
+        self.reached_target_once = False
 
-            # 이동 상태
-            self.is_busy = False
-            self.force_triggered = False
-            self.reached_target_once = False
-
-            # Narrator용 1회성 플래그
-            self._narrated_xy_align = False
-            self._narrated_xy_done = False
-            self._narrated_depth_done = False
-
-        except Exception as e:
-            self.get_logger().error(f"❌ Gripper/Init error: {e}")
-            raise
+        # Narrator용 1회성 플래그
+        self._narrated_xy_align = False
+        self._narrated_xy_done = False
+        self._narrated_depth_done = False
 
     # ─────────────────────────────────────────────────────────
     # 각 카메라별 감지
@@ -325,6 +326,8 @@ class MotionController(Node):
             if age > 1.2 and not getattr(self, "warned_cap_missing", False):
                 self.warned_cap_missing = True
                 self.say("주유구 인식 불가합니다. 주유구를 열어주세요")
+                # 🔥 Narrator 버전 (템플릿 기반)
+                # self.narrator.narrate("cap_not_detected")
                 self.get_logger().warn("⚠️ 주유구 인식 불가 — 음성 안내 출력됨")
                 return
 
@@ -359,6 +362,11 @@ class MotionController(Node):
                 # STEP 1) XY 중심정렬
                 # ------------------------
                 if not xy_centered:
+                    # 🔥 Narrator: XY 정렬 시작 (한 번만)
+                    if not self._narrated_xy_align:
+                        # self.narrator.narrate("xy_aligning")
+                        self._narrated_xy_align = True
+
                     gain = 0.6
                     move_x = -error_x * gain
                     move_y = -error_y * gain
@@ -388,9 +396,14 @@ class MotionController(Node):
                 self.xy_centered_once = True
                 return
             
-            self.check_crash(1)
+            movel(posx(0, -80, 0, 0, 0, 0), v=80, a=80, mod=DR_MV_MOD_REL)
+            wait(1.5)
 
-            movel(posx(35, -25, 0, 0, 0, 0), v=80, a=80, mod=DR_MV_MOD_REL)
+            self.ORIENT_FUEL_POS = get_current_posj()
+            self.check_crash(1)
+            self.gripper_move(0)
+
+            movel(posx(40, -40, 0, 0, 0, 0), v=80, a=80, mod=DR_MV_MOD_REL)
             wait(1.5)
             
             self.ORIENT_CAP_POS = get_current_posj()
@@ -424,11 +437,14 @@ class MotionController(Node):
             
             # ✅ 단계별 동작 분리
             if self.mode == "fuel_cap":
-                if not self.arrived_Y :
+                if not self.arrived_Y :                                                                                                                                                                                                                                                                                                                                                                                                                        
                     return
                 
                 movel(posx(0, 0, 0, 0, 45, 0), v=50, a=50, mod=DR_MV_MOD_REL)
                 wait(1.5)
+
+                # 🔥 Narrator: 캡 오픈 시작
+                # self.narrator.narrate("cap_open_start")
                 self.rotate_grip(2, True)
 
                 movel(posx(0, 30, 30, 0, 0, 0), v=80, a=80, mod=DR_MV_MOD_REL)
@@ -486,7 +502,7 @@ class MotionController(Node):
     # ─────────────────────────────────────────────────────────
     def check_crash(self, ori:int):
         from DSR_ROBOT2 import (task_compliance_ctrl, set_desired_force, get_tool_force,
-            release_force, release_compliance_ctrl, amovel, wait, DR_MV_MOD_REL)
+            release_force, release_compliance_ctrl, wait, DR_MV_MOD_REL)
         from DR_common2 import posx
         
         k_d = [500.0, 500.0, 500.0, 200.0, 200.0, 200.0]
@@ -508,7 +524,6 @@ class MotionController(Node):
                     release_force()
                     release_compliance_ctrl()
 
-                    self.gripper_move(0)
                     break
 
                 # 🔥 ROS 이벤트 처리: 이거 넣으면 음성 출력 가능해짐
@@ -526,7 +541,7 @@ class MotionController(Node):
                 force_ext = get_tool_force()
                 # c_pos = get_current_posx()
                 # x, y, z = c_pos[0]
-                if force_ext[2] > 4:
+                if force_ext[2] > 3:
                     release_force()
                     release_compliance_ctrl()
 
@@ -560,6 +575,10 @@ class MotionController(Node):
         from DR_common2 import posx, posj
         # 유종 상태 확인
         # fuel_type = getattr(self, "fuel_type", "").lower()
+
+        # 🔥 Narrator: 노즐 쪽으로 이동
+        # self.narrator.narrate("switch_to_nozzle", fuel_type=self.fuel_type or type)
+
         self.mode = "nozzle"
         self.start_fuel = True
         # 휘발유 → XL / 경유 → XR
@@ -577,7 +596,7 @@ class MotionController(Node):
         movej(target_pose, v=50, a=50, mod=DR_MV_MOD_ABS)
         wait(2)
         
-        movel(posx(50, 0, 0, 0, 0, 0), v=60, a=60, mod=DR_MV_MOD_REL)
+        movel(posx(60, 0, 0, 0, 0, 0), v=60, a=60, mod=DR_MV_MOD_REL)
         wait(1.5)
         self.gripper_move(480)
 
@@ -587,30 +606,55 @@ class MotionController(Node):
         self.ORIENT_GUN_POS = get_current_posj()
 
         # 저장했던 주유구 위치로 이동해서 주유건 꽂기
-        movej(posj(*self.ORIENT_CAP_POS), v=80, a=80)
+        movej(posj(*self.ORIENT_FUEL_POS), v=80, a=80)
         wait(2)
 
-        movel(posx(0, 0, -50, 0, 0, 0), v=60, a=60, mod=DR_MV_MOD_REL)
+        movel(posx(0, -50, -100, 0, 0, 0), v=60, a=60, mod=DR_MV_MOD_REL)
         wait(1.5)
-        movel(posx(0, -20, 0, 0, 0, 0), v=60, a=60, mod=DR_MV_MOD_REL)
-        wait(1.5)
-
+        
+        self.check_crash(1)
         self.run_fuel_task(3)
 
-        movel(posx(0, 40, 0, 0, 0, 0), v=60, a=60, mod=DR_MV_MOD_REL)
+        movel(posx(0, 60, 0, 0, 0, 0), v=60, a=60, mod=DR_MV_MOD_REL)
         wait(1.5)
 
         # 주유 완료 후 다시 주유건 위치로 이동
         movej(posj(*self.ORIENT_GUN_POS), v=80, a=80)
         wait(2)
 
-        movel(posx(90, 0, -25, 0, 0, 0), v=40, a=40, mod=DR_MV_MOD_REL)
+        movel(posx(90, 0, -15, 0, 0, 0), v=40, a=40, mod=DR_MV_MOD_REL)
         wait(1.5)
 
         self.gripper_move(0)
 
         movel(posx(-90, 0, 25, 0, 0, 0), v=40, a=40, mod=DR_MV_MOD_REL)
         wait(1.5)
+
+        movej([0, 0, 90, 0, 90, 0], 80, 80)
+        wait(1.0)
+        self.gripper_move(700)
+
+        self.check_crash(2)
+
+        movel(posx(0, 0, -30, 0, 0, 0), v=40, a=40, mod=DR_MV_MOD_REL)
+        wait(1.5)
+        self.gripper_move(450)
+
+        movej(posj(*self.ORIENT_CAP_POS), v=80, a=80)
+        wait(2)
+
+        self.rotate_grip(2, False)
+        self.gripper_move(0)
+
+        movel(posx(0, 30, 0, 0, 0, 0), v=40, a=40, mod=DR_MV_MOD_REL)
+        wait(1.5)
+
+        movej([0, 0, 90, 0, 90, 0], 80, 80)
+        wait(1.0)
+
+        # 🔥 Narrator: 노즐 복귀 + 전체 완료
+        self.narrator.narrate("return_nozzle")
+        self.narrator.narrate("finish")
 
         # 모든 주유 시퀀스 완료
         self._init_gripper_and_home()
@@ -659,6 +703,8 @@ class MotionController(Node):
     def run_fuel_task(self, cnt):
         from DSR_ROBOT2 import wait
         try:
+            # 🔥 Narrator: 주유 반복 시작
+            self.narrator.narrate("fueling")
             for i in range(cnt):
                 self.gripper.move(650)
                 wait(1.5)
